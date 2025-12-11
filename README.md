@@ -16,23 +16,6 @@ A compact, educational chess engine implementing a UCI (Universal Chess Interfac
 
 ---
 
-## Table of Contents
-
-- Getting started
-  - Requirements
-  - Build instructions
-- Usage
-  - Running the engine (UCI)
-  - Common UCI commands
-  - Example: running a match with cutechess-cli
-- Engine options & configuration
-- Development notes
-  - Suggested extension ideas
-- Contributing
-- License
-
----
-
 ## Getting started
 
 ### Requirements
