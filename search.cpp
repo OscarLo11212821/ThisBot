@@ -1,4 +1,19 @@
 namespace chess {
+
+static inline int scoreToTT(int score, int ply) {
+    constexpr int MATE = 20000;
+    if (score > MATE - 100) return score + ply;
+    if (score < -MATE + 100) return score - ply;
+    return score;
+}
+
+static inline int scoreFromTT(int score, int ply) {
+    constexpr int MATE = 20000;
+    if (score > MATE - 100) return score - ply;
+    if (score < -MATE + 100) return score + ply;
+    return score;
+}
+
 Move ThisBot::think(Board& board, int softMs, int hardMs, int maxDepth, std::uint64_t maxNodes) {
     timeSoftMs_ = softMs;
     timeHardMs_ = hardMs;
@@ -40,7 +55,6 @@ Move ThisBot::think(Board& board, int softMs, int hardMs, int maxDepth, std::uin
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start_).count();
         auto nps = elapsed > 0 ? (nodes_ * 1000LL) / elapsed : 0;
         
-        // Format score - detect mate scores
         std::string scoreStr;
         if (std::abs(score) >= MATE - 100) {
             int matePly = MATE - std::abs(score);
@@ -63,7 +77,6 @@ Move ThisBot::think(Board& board, int softMs, int hardMs, int maxDepth, std::uin
 
         if (timeSoftMs_ > 0 && elapsed >= timeSoftMs_) break;
         
-        // Mate detected? Stop searching
         if (std::abs(score) > 19000) break;
     }
 
@@ -74,7 +87,6 @@ Move ThisBot::think(Board& board, int softMs, int hardMs, int maxDepth, std::uin
 
 
 int ThisBot::quiescence(Board& board, int alpha, int beta, int qDepth) {
-    // just check timeUp flag, don't call timeExceeded()
     if (stopFlag_) { timeUp_ = true; return 0; }
     if (timeUp_ || qDepth > 10) return evaluate(board);
 
@@ -87,7 +99,6 @@ int ThisBot::quiescence(Board& board, int alpha, int beta, int qDepth) {
     MoveList moves;
     board.generateLegalMoves(moves);
 
-    // Filter and score captures/promotions
     std::vector<std::pair<int, Move>> scoredMoves;
     for (int i = 0; i < moves.size(); ++i) {
         Move m = moves[i];
@@ -95,7 +106,6 @@ int ThisBot::quiescence(Board& board, int alpha, int beta, int qDepth) {
         bool isPromo = m.type() == MT_PROMOTION;
         if (!isCapture && !isPromo) continue;
 
-        // MVV-LVA scoring
         int score = 0;
         if (isCapture) {
             PieceType captured = m.type() == MT_EN_PASSANT ? PAWN : board.pieceAt(m.to());
@@ -107,7 +117,6 @@ int ThisBot::quiescence(Board& board, int alpha, int beta, int qDepth) {
 
     if (scoredMoves.empty()) return alpha;
 
-    // Sort by score descending
     for (size_t i = 1; i < scoredMoves.size(); ++i) {
         auto temp = scoredMoves[i];
         int j = static_cast<int>(i) - 1;
@@ -122,14 +131,12 @@ int ThisBot::quiescence(Board& board, int alpha, int beta, int qDepth) {
         bool isCapture = !board.isEmpty(m.to()) || m.type() == MT_EN_PASSANT;
         bool isPromo = m.type() == MT_PROMOTION;
 
-        // Delta Pruning
         if (!isPromo) {
             PieceType captured = m.type() == MT_EN_PASSANT ? PAWN : board.pieceAt(m.to());
             int margin = (captured == PAWN || lowMaterial) ? 0 : 200;
             if (standPat + static_cast<int>(p.pieceValues[captured]) + margin < alpha) continue;
         }
 
-        // SEE Pruning
         if (!isPromo && isCapture) {
             int attacker = static_cast<int>(p.pieceValues[board.pieceAt(m.from())]);
             PieceType captured = m.type() == MT_EN_PASSANT ? PAWN : board.pieceAt(m.to());
@@ -153,7 +160,6 @@ int ThisBot::quiescence(Board& board, int alpha, int beta, int qDepth) {
 int ThisBot::search(Board& board, int depth, int alpha, int beta, int ply, Move prevMove) {
     if (ply >= 100) return evaluate(board);
     
-    // Track selective depth
     if (ply > selDepth_) selDepth_ = ply;
 
     if ((++nodes_ & 2047) == 0) {
@@ -178,27 +184,34 @@ int ThisBot::search(Board& board, int depth, int alpha, int beta, int ply, Move 
     int origAlpha = alpha;
     const auto& p = *params_;
 
-    // Draw check
     if (board.isDraw()) return 0;
+
+    // Check extension BEFORE TT probe
+    bool inCheck = board.inCheck();
+    if (inCheck) depth++;
+
+    if (depth <= 0) return quiescence(board, alpha, beta, 0);
 
     std::uint64_t key = hash(board);
     TTEntry& tt = tt_[key & (tt_.size() - 1)];
     Move ttMove;
     
-    // TT lookup and cutoff
+    // TT lookup - restrict cutoffs at PV nodes
     if (tt.key == key) {
         ttMove = tt.move;
         if (!isRoot && tt.depth >= depth) {
-            if (tt.flag == 1) return tt.score;
-            if (tt.flag == 2 && tt.score >= beta) return tt.score;
-            if (tt.flag == 3 && tt.score <= alpha) return tt.score;
+            int ttScore = scoreFromTT(tt.score, ply);
+            if (tt.flag == 1) {
+                // Exact score - can use at PV nodes
+                return ttScore;
+            }
+            if (!pvNode) {
+                // Bounds only usable at non-PV nodes
+                if (tt.flag == 2 && ttScore >= beta) return ttScore;
+                if (tt.flag == 3 && ttScore <= alpha) return ttScore;
+            }
         }
     }
-
-    bool inCheck = board.inCheck();
-    if (inCheck) depth++;
-
-    if (depth <= 0) return quiescence(board, alpha, beta, 0);
 
     int staticEval = inCheck ? -MATE : evaluate(board);
     bool lateEg = isLowMaterialEnding(board);
@@ -227,9 +240,20 @@ int ThisBot::search(Board& board, int depth, int alpha, int beta, int ply, Move 
     int moveCount = moves.size();
     if (moveCount == 0) {
         if (!inCheck) return 0;
-        // Prefer faster mates, especially when close to the 50-move limit
-        int mateScore = -MATE + ply + board.halfmove_;
+        int mateScore = -MATE + ply;
         return mateScore;
+    }
+
+    // Validate ttMove is in the legal move list
+    bool ttMoveValid = false;
+    if (!ttMove.isNull()) {
+        for (int i = 0; i < moveCount; ++i) {
+            if (moves[i] == ttMove) {
+                ttMoveValid = true;
+                break;
+            }
+        }
+        if (!ttMoveValid) ttMove = Move();
     }
 
     if (moveCount == 1) {
@@ -258,9 +282,12 @@ int ThisBot::search(Board& board, int depth, int alpha, int beta, int ply, Move 
                 }
             }
         }
-        // TT storage
+        
         if (tt.key != key || depth >= tt.depth) {
-            tt.key = key; tt.depth = depth; tt.score = bestScore; tt.move = bestMove;
+            tt.key = key; 
+            tt.depth = depth; 
+            tt.score = scoreToTT(bestScore, ply);
+            tt.move = bestMove;
             tt.flag = bestScore <= origAlpha ? 3 : bestScore >= beta ? 2 : 1;
         }
         return bestScore;
@@ -290,7 +317,6 @@ int ThisBot::search(Board& board, int depth, int alpha, int beta, int ply, Move 
         }
     }
 
-    // Sort moves by scores (simple insertion sort)
     for (int i = 1; i < moveCount; ++i) {
         int s = scores[i];
         Move m = moves[i];
@@ -311,13 +337,16 @@ int ThisBot::search(Board& board, int depth, int alpha, int beta, int ply, Move 
     int lmrIdx = std::min(depth, 63);
     const auto& lmrRow = pc.lmr[lmrIdx];
 
+    // Track quiet moves tried for history penalty
+    std::vector<Move> quietsTried;
+
     for (int i = 0; i < moveCount; ++i) {
         Move m = moves[i];
         bool isCapture = !board.isEmpty(m.to()) || m.type() == MT_EN_PASSANT;
         bool isPromotion = m.type() == MT_PROMOTION;
         bool isQuiet = !isCapture && !isPromotion;
 
-        // SEE-based capture pruning approximation
+        // SEE-based capture pruning
         if (m.type() != MT_EN_PASSANT && !board.isEmpty(m.to()) && movesSearched > 0 && !isPromotion) {
             PieceType attacker = board.pieceAt(m.from());
             PieceType victim = board.pieceAt(m.to());
@@ -327,12 +356,12 @@ int ThisBot::search(Board& board, int depth, int alpha, int beta, int ply, Move 
             }
         }
 
-        // Quiet pruning (disabled in sparse endgames)
+        // Quiet pruning
         if (!lateEg && !pvNode && !inCheck && depth <= 7 && staticEval + 100 * depth < alpha && movesSearched > 0 && isQuiet && bestScore > -19000) continue;
         if (!lateEg && !pvNode && !inCheck && depth <= 5 && movesSearched >= 4 + depth * depth / 2 && isQuiet && bestScore > -19000) continue;
 
         auto undo = board.makeMove(m);
-        bool givesCheck = board.inCheck();  // Check if move gives check
+        bool givesCheck = board.inCheck();
         int score;
 
         if (movesSearched >= 3 && depth >= 3 && isQuiet && !inCheck && !givesCheck) {
@@ -363,6 +392,10 @@ int ThisBot::search(Board& board, int depth, int alpha, int beta, int ply, Move 
                 if (alpha >= beta) {
                     if (isQuiet) {
                         history_[m.from()][m.to()] += depth * depth;
+                        // Penalize all quiets tried before the cutoff move
+                        for (const Move& q : quietsTried) {
+                            history_[q.from()][q.to()] -= depth * depth;
+                        }
                         if (ply < 128) {
                             if (!(m == killers_[ply][0])) {
                                 killers_[ply][1] = killers_[ply][0];
@@ -378,16 +411,17 @@ int ThisBot::search(Board& board, int depth, int alpha, int beta, int ply, Move 
             }
         }
 
+        // Track quiets tried, don't penalize here
         if (isQuiet) {
-            history_[m.from()][m.to()] -= depth * depth;
+            quietsTried.push_back(m);
         }
     }
 
-    // TT storage
+    // TT storage with mate score adjustment
     if (tt.key != key || depth >= tt.depth) {
         tt.key = key;
         tt.depth = depth;
-        tt.score = bestScore;
+        tt.score = scoreToTT(bestScore, ply);
         tt.move = bestMove;
         tt.flag = bestScore <= origAlpha ? 3 : (bestScore >= beta ? 2 : 1);
     }
