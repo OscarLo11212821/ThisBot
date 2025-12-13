@@ -685,7 +685,9 @@ public:
     //========================================================================
     bool isCheckmate() { MoveList m; generateLegalMoves(m); return m.size() == 0 && inCheck(); }
     bool isStalemate() { MoveList m; generateLegalMoves(m); return m.size() == 0 && !inCheck(); }
-    bool isDraw() { return isStalemate() || halfmove_ >= 100 || isRepetition(); }
+    bool isDraw(int searchPly = 0) {
+        return halfmove_ >= 100 || isRepetition(searchPly);
+    }
     
     //========================================================================
     // Display
