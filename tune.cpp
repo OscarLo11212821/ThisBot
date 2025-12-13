@@ -1,4 +1,5 @@
 namespace chess {
+
 struct SpsaConfig {
     int iterations = 5;
     int gamesPerIteration = 4;
@@ -155,6 +156,7 @@ private:
         return cfg_.gamesPerIteration == 0 ? 0.0 : sum / cfg_.gamesPerIteration;
     }
 
+    // CHANGE: avoid redundant generateLegalMoves() each ply; only do it if think() fails.
     double playSingleGame(const EvalParams& whiteParams, const EvalParams& blackParams, bool plusIsWhite, unsigned seed) const {
         Board board;
         board.reset();
@@ -180,16 +182,21 @@ private:
 
         double result = 0.0;
         for (int ply = 0; ply < cfg_.maxPlies; ++ply) {
-            MoveList legals;
-            board.generateLegalMoves(legals);
-            if (legals.size() == 0) {
-                result = board.inCheck() ? (board.sideToMove_ == WHITE ? -1.0 : 1.0) : 0.0;
+            ThisBot& engine = board.sideToMove_ == WHITE ? white : black;
+
+            Move mv = engine.think(board, cfg_.moveTimeMs, cfg_.moveTimeMs, cfg_.searchDepth);
+
+            if (mv.isNull()) {
+                // Only now determine if it's mate/stalemate or an engine failure.
+                MoveList legals;
+                board.generateLegalMoves(legals);
+                if (legals.size() == 0) {
+                    result = board.inCheck() ? (board.sideToMove_ == WHITE ? -1.0 : 1.0) : 0.0;
+                } else {
+                    result = 0.0;
+                }
                 break;
             }
-
-            ThisBot& engine = board.sideToMove_ == WHITE ? white : black;
-            Move mv = engine.think(board, cfg_.moveTimeMs, cfg_.moveTimeMs, cfg_.searchDepth);
-            if (mv.isNull()) { result = 0.0; break; }
 
             auto undo = board.makeMove(mv);
             (void)undo;
@@ -232,6 +239,11 @@ struct PositionGenConfig {
     int labelDepth = 4;
     int labelMoveTimeMs = 40;
     std::uint64_t labelMaxNodes = 0;
+    bool useSearchMoves = true;
+    int  playoutDepth = 4;
+    int  playoutMoveTimeMs = 0;
+    std::uint64_t playoutMaxNodes = 0;
+    int  playoutPickMarginCp = 40;
     int evalClip = 3000;
 };
 
@@ -292,36 +304,87 @@ public:
     }
 
 private:
-    Move pickMove(Board& board, ThisBot& evaluator, std::mt19937& rng) const {
+    // CHANGE: pickMove now returns both the chosen move and (optionally) a root score
+    // so we can reuse search work for labeling when configs match.
+    struct PickResult {
+        Move move;
+        int  rootScoreCp = 0;     // score for side-to-move at root (centipawns)
+        bool hasRootScore = false;
+    };
+
+    PickResult pickMove(Board& board, ThisBot& evaluator, std::mt19937& rng) const {
         MoveList moves;
         board.generateLegalMoves(moves);
-        if (moves.size() == 0) return Move();
+        if (moves.size() == 0) return {Move(), 0, false};
 
-        std::vector<std::pair<int, Move>> scored;
-        scored.reserve(moves.size());
+        // Old behavior if disabled
+        if (!cfg_.useSearchMoves || cfg_.playoutDepth <= 1) {
+            std::vector<std::pair<int, Move>> scored;
+            scored.reserve(moves.size());
+            for (int i = 0; i < moves.size(); ++i) {
+                Move m = moves[i];
+                auto undo = board.makeMove(m);
+                int score = -evaluator.evaluateForTuning(board);
+                board.unmakeMove(m, undo);
+                scored.push_back({score, m});
+            }
+
+            std::shuffle(scored.begin(), scored.end(), rng);
+            int sample = std::min(cfg_.moveSample, static_cast<int>(scored.size()));
+            auto best = scored[0];
+            for (int i = 1; i < sample; ++i) if (scored[i].first > best.first) best = scored[i];
+
+            return {best.second, best.first, false};
+        }
+
+        // Step 1: cheap prefilter by static eval (keeps it fast)
+        std::vector<std::pair<int, Move>> pre;
+        pre.reserve(moves.size());
         for (int i = 0; i < moves.size(); ++i) {
             Move m = moves[i];
             auto undo = board.makeMove(m);
-            int score = -evaluator.evaluateForTuning(board);
+            int s = -evaluator.evaluateForTuning(board);
             board.unmakeMove(m, undo);
-            scored.push_back({score, m});
+            pre.push_back({s, m});
         }
 
-        std::shuffle(scored.begin(), scored.end(), rng);
-        int sample = std::min(cfg_.moveSample, static_cast<int>(scored.size()));
-        std::pair<int, Move> best = scored[0];
-        for (int i = 1; i < sample; ++i) {
-            if (scored[i].first > best.first) best = scored[i];
+        std::sort(pre.begin(), pre.end(), [](auto& a, auto& b){ return a.first > b.first; });
+
+        int sample = std::min(cfg_.moveSample, static_cast<int>(pre.size()));
+        if (sample <= 0) sample = 1;
+
+        // Step 2: search-score the top-N candidates
+        std::vector<std::pair<int, Move>> scored;
+        scored.reserve(sample);
+
+        for (int i = 0; i < sample; ++i) {
+            Move m = pre[i].second;
+            int s = evaluator.scoreMoveSearch(board, m,
+                                            cfg_.playoutDepth,
+                                            cfg_.playoutMoveTimeMs,
+                                            cfg_.playoutMaxNodes);
+            scored.push_back({s, m});
         }
-        return best.second;
+
+        // Step 3: pick among near-best for diversity (optional)
+        int bestScore = scored[0].first;
+        for (auto& sm : scored) bestScore = std::max(bestScore, sm.first);
+
+        std::vector<Move> bucket;
+        for (auto& sm : scored) {
+            if (sm.first >= bestScore - cfg_.playoutPickMarginCp)
+                bucket.push_back(sm.second);
+        }
+        if (bucket.empty()) bucket.push_back(scored[0].second);
+
+        std::uniform_int_distribution<int> dist(0, static_cast<int>(bucket.size()) - 1);
+        return {bucket[dist(rng)], bestScore, true};
     }
 
     int labelPosition(ThisBot& evaluator, Board& board) const {
         int score = 0;
         if (cfg_.useSearchLabels) {
-            Move mv = evaluator.think(board, cfg_.labelMoveTimeMs, cfg_.labelMoveTimeMs, cfg_.labelDepth, cfg_.labelMaxNodes);
-            (void)mv;
-            score = evaluator.lastScore();
+            score = evaluator.searchScore(board, cfg_.labelDepth, cfg_.labelMoveTimeMs, cfg_.labelMaxNodes);
         } else {
             score = evaluator.evaluateForTuning(board);
         }
@@ -330,6 +393,7 @@ private:
         return score;
     }
 
+    // CHANGE: reuse pickMove()'s search scores for labels when label config matches playout config.
     std::vector<PositionEvalSample> playGame(const std::string& seedFen, ThisBot& evaluator, std::mt19937& rng) const {
         Board board;
         board.setFEN(seedFen);
@@ -348,21 +412,40 @@ private:
         std::vector<PositionEvalSample> collected;
         collected.reserve(cfg_.positionsPerGame * 2);
 
-        // FIX: Randomize the starting offset. 
-        // If sampleStride is 2, this will be 0 or 1.
-        // This ensures we capture both White-to-move and Black-to-move positions across different games.
+        // Randomize the starting offset to cover both sides-to-move over many games.
         std::uniform_int_distribution<int> offsetDist(0, std::max(1, cfg_.sampleStride) - 1);
         int startOffset = offsetDist(rng);
 
         for (int ply = 0; ply < cfg_.maxPlies; ++ply) {
-            // Apply the offset to the modulo check
-            if (((ply + startOffset) % cfg_.sampleStride) == 0 && !board.inCheck()) {
-                collected.push_back({board.toFEN(), labelPosition(evaluator, board)});
+            const bool wantSample = (((ply + startOffset) % cfg_.sampleStride) == 0) && !board.inCheck();
+
+            // Pick move first; this may already run search (we can reuse that score as the label).
+            PickResult pr = pickMove(board, evaluator, rng);
+            if (pr.move.isNull()) break;
+
+            if (wantSample) {
+                int label = 0;
+
+                const bool canReuseSearchLabel =
+                    cfg_.useSearchLabels &&
+                    cfg_.useSearchMoves &&
+                    pr.hasRootScore &&
+                    (cfg_.labelDepth == cfg_.playoutDepth) &&
+                    (cfg_.labelMoveTimeMs == cfg_.playoutMoveTimeMs) &&
+                    (cfg_.labelMaxNodes == cfg_.playoutMaxNodes);
+
+                if (canReuseSearchLabel) {
+                    label = pr.rootScoreCp;
+                    if (label > cfg_.evalClip) label = cfg_.evalClip;
+                    else if (label < -cfg_.evalClip) label = -cfg_.evalClip;
+                } else {
+                    label = labelPosition(evaluator, board);
+                }
+
+                collected.push_back({board.toFEN(), label});
             }
 
-            Move mv = pickMove(board, evaluator, rng);
-            if (mv.isNull()) break;
-            board.makeMove(mv);
+            board.makeMove(pr.move);
 
             if (board.isCheckmate() || board.isStalemate() || board.halfmove_ >= 100) break;
         }
@@ -460,13 +543,6 @@ public:
             
             double result = 0.5;
             for (int ply = 0; ply < cfg_.maxPlies; ++ply) {
-                MoveList legals;
-                board.generateLegalMoves(legals);
-                if (legals.size() == 0) {
-                    result = board.inCheck() ? (board.sideToMove_ == WHITE ? 0.0 : 1.0) : 0.5;
-                    break;
-                }
-                
                 // Store position (skip very early and checks for cleaner data)
                 if (ply >= 8 && !board.inCheck()) {
                     gameFens.push_back(board.toFEN());
@@ -474,7 +550,18 @@ public:
                 
                 ThisBot& engine = board.sideToMove_ == WHITE ? white : black;
                 Move mv = engine.think(board, cfg_.moveTimeMs, cfg_.moveTimeMs, cfg_.searchDepth);
-                if (mv.isNull()) { result = 0.5; break; }
+
+                // CHANGE: avoid redundant generateLegalMoves() each ply; only do it if think() fails.
+                if (mv.isNull()) {
+                    MoveList legals;
+                    board.generateLegalMoves(legals);
+                    if (legals.size() == 0) {
+                        result = board.inCheck() ? (board.sideToMove_ == WHITE ? 0.0 : 1.0) : 0.5;
+                    } else {
+                        result = 0.5;
+                    }
+                    break;
+                }
                 
                 board.makeMove(mv);
                 
@@ -654,4 +741,5 @@ private:
         return totalError / positions_.size();
     }
 };
+
 } // namespace chess
