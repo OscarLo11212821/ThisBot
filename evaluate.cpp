@@ -1,16 +1,16 @@
 namespace chess {
 struct EvalParams {
-    std::array<double, 7> pieceValues { 99.3822,314.733,380.101,541.51,1044.64,19999.9,0 };
-    std::array<double, 7> mobilityBonus { 0.160872,7.36212,6.14346,6.04696,3.85917,0.664638,1.14357 };
-    std::array<double, 9> attackWeight { -0.000981821,2.10757,40.9666,50.2753,84.8107,74.2553,64.5122,86.6854,116.361 };
-    std::array<double, 7> pieceAttackValue { 0.986095,9.71606,17.0647,40.8964,61.4522,-0.231451,-1.74004 };
-    std::array<double, 8> passedPawnBonus { -1.71803,-0.473794,13.9269,10.8251,43.2717,85.4087,132.093,-0.155815 };
-    std::array<double, 2> knightOutpostBonus { 15.7898,13.1835 };
-    std::array<double, 2> rookFileBonus { 16.3991,9.78526 };
-    std::array<double, 4> developmentWeights { 24.1401,12.5947,8.64822,36.8425 };
-    std::array<double, 3> kingShieldValues { 10.5645,20.5211,15.4374 };
-    std::array<double, 2> rookSeventhBonus { 25.0, 40.0 };
-    std::array<double, 2> badBishopPenalty { 12.0, 4.0 };
+    std::array<double, 7> pieceValues { 99.1802,315.696,379.541,541.839,1045.78,20000.2,0 };
+    std::array<double, 7> mobilityBonus { 0.558513,6.02874,6.76868,4.99854,5.36574,-1.17361,1.06308 };
+    std::array<double, 9> attackWeight { -1.38263,3.8379,39.6664,51.0186,85.7022,74.4797,64.7077,86.6042,116.352 };
+    std::array<double, 7> pieceAttackValue { -0.127949,9.01816,17.0672,41.3365,62.978,-0.344534,-1.83642 };
+    std::array<double, 8> passedPawnBonus { -2.11314,-2.56899,12.6536,10.6128,44.3603,85.3953,131.088,2.05708 };
+    std::array<double, 2> knightOutpostBonus { 15.1689,11.0465 };
+    std::array<double, 2> rookFileBonus { 16.7742,10.5363 };
+    std::array<double, 4> developmentWeights { 23.0955,12.6867,8.71504,36.1943 };
+    std::array<double, 3> kingShieldValues { 10.5231,20.2514,16.2529 };
+    std::array<double, 2> rookSeventhBonus { 25.0444,39.8164 };
+    std::array<double, 2> badBishopPenalty { 12.2557,3.85626 };
 
     // PST tables - [piece_type][square] for pawn(0), knight(1), bishop(2), rook(3), queen(4), king_mg(5)
     std::array<std::array<double, 64>, 6> pst;
@@ -120,6 +120,7 @@ struct EvalParams {
         p.developmentWeights = { -50, -50, -50, -50 };
         p.kingShieldValues = { -50, -50, -50 };
         p.rookSeventhBonus = { -20, -20 };
+        p.badBishopPenalty = { 0, 0 };
         
         // PST bounds: allow reasonable range for piece placement
         for (int pt = 0; pt < 6; ++pt) {
@@ -146,6 +147,7 @@ struct EvalParams {
         p.developmentWeights = { 150, 150, 150, 150 };
         p.kingShieldValues = { 200, 200, 200 };
         p.rookSeventhBonus = { 80, 100 };
+        p.badBishopPenalty = { 60, 60 };
         
         // PST bounds
         for (int pt = 0; pt < 6; ++pt) {
@@ -176,6 +178,8 @@ public:
     void setEvalParams(std::shared_ptr<EvalParams> params) { params_ = std::move(params); }
     const EvalParams& evalParams() const { return *params_; }
     int lastScore() const { return prevScore_; }
+    int searchScore(Board& board, int depth, int hardMs = 0, std::uint64_t maxNodes = 0);
+    int scoreMoveSearch(Board& board, Move m, int depth, int hardMs = 0, std::uint64_t maxNodes = 0);
 
     int evaluateForTuning(Board& board) { return evaluate(board); }
 
