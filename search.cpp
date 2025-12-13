@@ -184,7 +184,7 @@ int ThisBot::search(Board& board, int depth, int alpha, int beta, int ply, Move 
     int origAlpha = alpha;
     const auto& p = *params_;
 
-    if (board.isDraw()) return 0;
+    if (board.isDraw(ply)) return 0;
 
     // Check extension BEFORE TT probe
     bool inCheck = board.inCheck();
@@ -427,6 +427,42 @@ int ThisBot::search(Board& board, int depth, int alpha, int beta, int ply, Move 
     }
 
     return bestScore;
+}
+
+int ThisBot::searchScore(Board& board, int depth, int hardMs, std::uint64_t maxNodes) {
+    timeSoftMs_ = 0;
+    timeHardMs_ = hardMs;
+    maxNodes_   = maxNodes;
+
+    timeUp_ = false;
+    stopFlag_ = false;
+    nodes_ = 0;
+    selDepth_ = 0;
+    start_ = std::chrono::steady_clock::now();
+    bestRoot_ = Move();
+
+    int alpha = -INF, beta = INF;
+    int score = search(board, depth, alpha, beta, 0, Move());
+
+    // If we hit limits, return something stable rather than 0-spikes
+    if (timeUp_) return evaluate(board);
+    return score;
+}
+
+int ThisBot::scoreMoveSearch(Board& board, Move m, int depth, int hardMs, std::uint64_t maxNodes) {
+    if (depth <= 1) {
+        // fall back to 1-ply static (still from current side POV)
+        auto u = board.makeMove(m);
+        int s = -evaluate(board);
+        board.unmakeMove(m, u);
+        return s;
+    }
+
+    auto u = board.makeMove(m);
+    // after making m, opponent to move, so negate
+    int s = -searchScore(board, depth - 1, hardMs, maxNodes);
+    board.unmakeMove(m, u);
+    return s;
 }
 
 } // namespace chess
